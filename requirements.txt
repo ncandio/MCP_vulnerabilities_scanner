@@ -1,0 +1,2 @@
+# Core dependencies
+tkinter  # Usually included with Python installation

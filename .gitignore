@@ -1,0 +1,25 @@
+# Python virtual environment
+MCP_SCAN/
+
+# Python byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Local development settings
+.env
+.venv
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Reports directory (contains scan results)
+# reports/
