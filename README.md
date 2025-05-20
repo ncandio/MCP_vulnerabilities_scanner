@@ -1,5 +1,7 @@
 # Security Scanner MCP
 
+Welcome to Security Scanner MCP, an all-in-one security scanning interface that simplifies vulnerability detection across your files and web applications. This tool consolidates multiple security scanners into a single, user-friendly GUI application.
+
 This is an experimental client application that interfaces with external vulnerability scanning tools to test applications for security issues. It is designed as a proof of concept for integrating with services like VirusTotal, OWASP ZAP, and dependency scanners.
 
 ## Purpose
