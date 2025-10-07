@@ -7,6 +7,8 @@ import configparser
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
+import requests
+from zapv2 import ZAPv2
 
 class SecurityScannerMCP:
     """Main application class for the Security Scanner MCP application."""
@@ -761,6 +763,10 @@ class VirusTotalScanner:
         """
         self.api_key = api_key
         self.base_url = "https://www.virustotal.com/api/v3"
+        self.headers = {
+            "x-apikey": self.api_key,
+            "User-Agent": "SecurityScannerMCP/1.0"
+        }
         
     def set_api_key(self, api_key):
         """Update the API key.
@@ -769,6 +775,7 @@ class VirusTotalScanner:
             api_key: New VirusTotal API key
         """
         self.api_key = api_key
+        self.headers["x-apikey"] = self.api_key
         
     def scan_file(self, file_path):
         """Scan a file using VirusTotal API.
@@ -782,46 +789,48 @@ class VirusTotalScanner:
         if not self.api_key:
             return {"error": "VirusTotal API key not configured"}
         
-        # In a real app, this would make actual API calls to VirusTotal
-        # For demo purposes, simulate the scan with a delay
+        if not self.api_key or self.api_key == '':
+            return {"error": "VirusTotal API key not configured"}
         
-        # Calculate file hash for lookup
-        file_hash = self._calculate_file_hash(file_path)
-        
-        # Simulate API delay
-        time.sleep(2)
-        
-        # Simulate VirusTotal response
-        file_size = os.path.getsize(file_path)
-        file_name = os.path.basename(file_path)
-        
-        # Determine positives based on file size for demo purposes
-        positives = int(file_size % 10)
-        
-        return {
-            "scan_id": f"scan-{file_hash[:8]}",
-            "resource": file_hash,
-            "response_code": 1,
-            "scan_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "permalink": f"https://www.virustotal.com/gui/file/{file_hash}/detection",
-            "verbose_msg": "Scan finished",
-            "total": 68,
-            "positives": positives,
-            "sha256": file_hash,
-            "md5": file_hash[:32],
-            "file_name": file_name,
-            "file_size": file_size,
-            "scans": {
-                "Kaspersky": {"detected": positives > 3, "version": "21.0.1.45", 
-                            "result": "Trojan.Win32.Generic" if positives > 3 else None},
-                "McAfee": {"detected": positives > 2, "version": "6.0.6.653", 
-                          "result": "W32/Suspicious_Gen.by" if positives > 2 else None},
-                "Symantec": {"detected": positives > 4, "version": "1.15.0.0", 
-                           "result": "Suspicious.Cloud.5" if positives > 4 else None},
-                "Microsoft": {"detected": positives > 1, "version": "1.1.19200.5", 
-                            "result": "PUA:Win32/Suspicious" if positives > 1 else None}
-            }
-        }
+        try:
+            # Calculate file hash first to check if it already exists in VirusTotal
+            file_hash = self._calculate_file_hash(file_path)
+            
+            # First, try to get report for existing file
+            report_url = f"{self.base_url}/files/{file_hash}"
+            response = requests.get(report_url, headers=self.headers)
+            
+            if response.status_code == 200:
+                # File was already analyzed, return the existing report
+                result = response.json()
+                return self._parse_virustotal_report(result)
+            elif response.status_code == 404:
+                # If file doesn't exist in VT, upload it for analysis
+                upload_url = f"{self.base_url}/files"
+                with open(file_path, 'rb') as f:
+                    files = {'file': (os.path.basename(file_path), f)}
+                    upload_response = requests.post(upload_url, files=files, headers=self.headers)
+                
+                if upload_response.status_code == 200:
+                    upload_result = upload_response.json()
+                    scan_id = upload_result['data']['id']
+                    
+                    # Return the analysis ID for later retrieval
+                    return {
+                        "scan_id": scan_id,
+                        "resource": file_hash,
+                        "status": "submitted",
+                        "message": "File submitted for analysis. Check back later for results."
+                    }
+                else:
+                    return {"error": f"Upload failed with status code {upload_response.status_code}: {upload_response.text}"}
+            else:
+                return {"error": f"Request failed with status code {response.status_code}: {response.text}"}
+                
+        except requests.exceptions.RequestException as e:
+            return {"error": f"Network error: {str(e)}"}
+        except Exception as e:
+            return {"error": f"Unexpected error: {str(e)}"}
     
     def _calculate_file_hash(self, file_path):
         """Calculate SHA-256 hash of a file.
@@ -838,97 +847,145 @@ class VirusTotalScanner:
             for byte_block in iter(lambda: f.read(4096), b""):
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
+    
+    def _parse_virustotal_report(self, response_data):
+        """Parse VirusTotal API response into standardized format.
+        
+        Args:
+            response_data: Raw response from VirusTotal API
+            
+        Returns:
+            dict: Parsed and formatted results
+        """
+        try:
+            attributes = response_data['data']['attributes']
+            stats = attributes['stats']
+            last_analysis_results = attributes['last_analysis_results']
+            
+            # Parse scan results
+            scans = {}
+            for engine, result in last_analysis_results.items():
+                scans[engine] = {
+                    "detected": result['category'] == 'malicious',
+                    "result": result.get('result', None),
+                    "version": result.get('engine_version', None)
+                }
+            
+            return {
+                "scan_id": response_data['data']['id'],
+                "resource": response_data['data']['id'],
+                "scan_date": attributes.get('last_analysis_date', ''),
+                "permalink": attributes.get('permalink', ''),
+                "total": stats.get('total', 0),
+                "positives": stats.get('malicious', 0),
+                "sha256": attributes.get('sha256', ''),
+                "md5": attributes.get('md5', ''),
+                "file_name": attributes.get('meaningful_name', ''),
+                "file_size": attributes.get('size', 0),
+                "scans": scans
+            }
+        except KeyError as e:
+            return {"error": f"Unexpected response format: {str(e)}"}
 
 
 class OWASPZAPScanner:
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "http://localhost:8080"
+        self.zap = ZAPv2(
+            apikey=self.api_key,
+            proxies={'http': self.base_url, 'https': self.base_url}
+        )
         
     def set_api_key(self, api_key):
         self.api_key = api_key
+        self.zap = ZAPv2(
+            apikey=self.api_key,
+            proxies={'http': self.base_url, 'https': self.base_url}
+        )
         
     def scan_url(self, url, options):
         """Scan a URL using OWASP ZAP"""
-        if not self.api_key:
+        if not self.api_key or self.api_key == '':
             return {"error": "OWASP ZAP API key not configured"}
         
-        # In a real app, this would make actual API calls to ZAP
-        # For demo purposes, simulate the scan with a delay
-        
-        # Simulate spider crawl
-        if options.get("crawl", False):
-            time.sleep(3)
+        try:
+            # Start the spider scan
+            if options.get("crawl", False):
+                spider_scan_id = self.zap.spider.scan(url)
+                
+                # Wait for spider to complete
+                while int(self.zap.spider.status(spider_scan_id)) < 100:
+                    time.sleep(5)  # Wait for 5 seconds before checking again
             
-        # Simulate AJAX spider
-        if options.get("ajax", False):
-            time.sleep(2)
+            # Run AJAX spider if requested
+            if options.get("ajax", False):
+                ajax_scan_id = self.zap.ajaxSpider.scan(url)
+                
+                # Wait for AJAX spider to complete
+                while self.zap.ajaxSpider.status() not in ["stopped", "finished"]:
+                    time.sleep(5)  # Wait for 5 seconds before checking again
             
-        # Simulate active scan
-        time.sleep(2)
+            # Start the active scan
+            scan_id = self.zap.ascan.scan(url)
+            
+            # Wait for active scan to complete
+            while int(self.zap.ascan.status(scan_id)) < 100:
+                time.sleep(10)  # Wait for 10 seconds before checking again
+            
+            # Get the alerts (vulnerabilities found)
+            alerts = self.zap.core.alerts(baseurl=url)
+            
+            # Convert ZAP alerts to our standard format
+            standardized_alerts = []
+            for alert in alerts:
+                standardized_alerts.append({
+                    "alert": alert.get('alert', ''),
+                    "risk": self._map_zap_risk_to_standard(alert.get('risk', '')),
+                    "confidence": alert.get('confidence', ''),
+                    "description": alert.get('description', ''),
+                    "instances": [alert.get('url', url)],
+                    "solution": alert.get('solution', ''),
+                    "cweid": alert.get('cweid', ''),
+                    "wascid": alert.get('wascid', '')
+                })
+            
+            return {
+                "scan_id": scan_id,
+                "status": "completed",
+                "scan_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "url": url,
+                "alerts": standardized_alerts,
+                "alert_count": len(standardized_alerts)
+            }
+            
+        except Exception as e:
+            return {"error": f"ZAP scan failed: {str(e)}"}
+    
+    def _map_zap_risk_to_standard(self, zap_risk):
+        """Map ZAP risk levels to standard risk levels.
         
-        # Simulate ZAP response
-        return {
-            "scan_id": f"zap-scan-{int(time.time())}",
-            "status": "completed",
-            "scan_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "url": url,
-            "alerts": [
-                {
-                    "alert": "SQL Injection",
-                    "risk": "High",
-                    "confidence": "Medium",
-                    "description": "SQL injection may be possible.",
-                    "instances": [f"{url}/search?id=1"],
-                    "solution": "Use parameterized queries or stored procedures."
-                },
-                {
-                    "alert": "Cross-Site Scripting (XSS)",
-                    "risk": "Medium",
-                    "confidence": "High",
-                    "description": "Cross-site scripting vulnerabilities allow attackers to inject client-side scripts.",
-                    "instances": [f"{url}/comments"],
-                    "solution": "Implement Content Security Policy and output encoding."
-                },
-                {
-                    "alert": "Missing HTTP Strict Transport Security",
-                    "risk": "Medium",
-                    "confidence": "High",
-                    "description": "The HSTS header is missing, allowing downgrade attacks.",
-                    "instances": [url],
-                    "solution": "Configure web server to add HSTS header."
-                },
-                {
-                    "alert": "Weak HTTPS Ciphers",
-                    "risk": "Medium",
-                    "confidence": "Medium",
-                    "description": "The site uses weak HTTPS ciphers.",
-                    "instances": [url],
-                    "solution": "Configure server to use strong cipher suites."
-                },
-                {
-                    "alert": "Cookie Without Secure Flag",
-                    "risk": "Medium",
-                    "confidence": "High",
-                    "description": "Cookies are not marked as secure, allowing transmission over unencrypted connections.",
-                    "instances": [url],
-                    "solution": "Set the secure flag on all cookies."
-                },
-                {
-                    "alert": "Missing X-Content-Type-Options",
-                    "risk": "Low",
-                    "confidence": "High",
-                    "description": "The X-Content-Type-Options header is missing, allowing MIME type sniffing.",
-                    "instances": [url],
-                    "solution": "Configure web server to add X-Content-Type-Options: nosniff."
-                }
-            ]
+        Args:
+            zap_risk: Risk level from ZAP (e.g., "High", "Medium", "Low", "Informational")
+            
+        Returns:
+            Standardized risk level
+        """
+        risk_mapping = {
+            "High": "High",
+            "Medium": "Medium", 
+            "Low": "Low",
+            "Informational": "Info",
+            "Information": "Info"
         }
+        
+        return risk_mapping.get(zap_risk, zap_risk)
 
 
 class DependencyScanner:
     def __init__(self, api_key):
         self.api_key = api_key
+        self.nvd_api_base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         
     def set_api_key(self, api_key):
         self.api_key = api_key
@@ -938,109 +995,292 @@ class DependencyScanner:
         if not self.api_key:
             return {"error": "Dependency Scanner API key not configured"}
         
-        # In a real app, this would make actual API calls or run a local scan
-        # For demo purposes, simulate the scan with a delay
+        try:
+            # Extract dependencies from the file based on its type
+            dependencies = self._extract_dependencies(file_path)
+            
+            # Check each dependency for vulnerabilities
+            vulnerabilities = []
+            for dep in dependencies:
+                dep_vulns = self._check_dependency_vulnerabilities(dep["name"], dep["version"])
+                vulnerabilities.extend(dep_vulns)
+            
+            return {
+                "scan_id": f"dep-scan-{int(time.time())}",
+                "file": file_path,
+                "scan_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "dependencies": dependencies,
+                "vulnerabilities": vulnerabilities,
+                "summary": {
+                    "total_dependencies": len(dependencies),
+                    "vulnerable_dependencies": len(set(v["package"] for v in vulnerabilities)),
+                    "high_severity": sum(1 for v in vulnerabilities if v["severity"].lower() in ["high", "critical"]),
+                    "medium_severity": sum(1 for v in vulnerabilities if v["severity"].lower() == "medium"),
+                    "low_severity": sum(1 for v in vulnerabilities if v["severity"].lower() == "low")
+                }
+            }
+            
+        except Exception as e:
+            return {"error": f"Dependency scan failed: {str(e)}"}
+    
+    def _extract_dependencies(self, file_path):
+        """Extract dependencies from the file based on the file type.
         
-        # Simulate scanning delay
-        time.sleep(3)
-        
-        # Determine file type
+        Args:
+            file_path: Path to the file to analyze
+            
+        Returns:
+            List of dependencies with name and version
+        """
+        dependencies = []
         file_ext = os.path.splitext(file_path)[1].lower()
         
-        # Sample dependencies based on file type
+        try:
+            if file_ext in ['.py', '.pip']:
+                dependencies = self._extract_python_dependencies(file_path)
+            elif file_ext in ['.js', '.json'] and 'package.json' in file_path:
+                dependencies = self._extract_npm_dependencies(file_path)
+            elif file_ext in ['.xml'] and 'pom.xml' in file_path:
+                dependencies = self._extract_maven_dependencies(file_path)
+            elif file_ext in ['.gradle', '.properties'] and 'build.gradle' in file_path:
+                dependencies = self._extract_gradle_dependencies(file_path)
+            elif file_ext in ['.csproj', '.vbproj', '.props', '.targets']:
+                dependencies = self._extract_nuget_dependencies(file_path)
+            # For executable files, we could use other techniques to determine dependencies
+            # but for this demo, we'll use a basic analysis based on file extension
+            else:
+                # If we can't parse the specific format, return an empty list
+                # In a real implementation, we would analyze the binary for known library signatures
+                pass
+        except Exception:
+            # If parsing fails, try to determine dependencies based on file extension
+            pass
+            
+        return dependencies
+    
+    def _extract_python_dependencies(self, file_path):
+        """Extract Python dependencies from requirements.txt or setup.py."""
         dependencies = []
+        
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+                
+            # For requirements.txt files
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith("-"):
+                    # Split on common version specifiers
+                    if "==" in line:
+                        name, version = line.split("==", 1)
+                        dependencies.append({"name": name.strip(), "version": version.strip()})
+                    elif ">=" in line:
+                        name, version = line.split(">=", 1)
+                        dependencies.append({"name": name.strip(), "version": version.strip()})
+                    elif "<=" in line:
+                        name, version = line.split("<=", 1)
+                        dependencies.append({"name": name.strip(), "version": version.strip()})
+                    elif ">" in line and not line.startswith(">"):  # Avoid lines starting with ">"
+                        name, version = line.split(">", 1)
+                        dependencies.append({"name": name.strip(), "version": version.strip()})
+                    elif "<" in line and not line.startswith("<"):  # Avoid lines starting with "<"
+                        name, version = line.split("<", 1)
+                        dependencies.append({"name": name.strip(), "version": version.strip()})
+                    else:
+                        # Just the package name without version
+                        dependencies.append({"name": line.strip(), "version": "unknown"})
+        except Exception:
+            # Fallback if file parsing fails
+            pass
+            
+        return dependencies
+    
+    def _extract_npm_dependencies(self, file_path):
+        """Extract NPM dependencies from package.json."""
+        import json
+        dependencies = []
+        
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                
+            # Get dependencies from both dependencies and devDependencies
+            for dep_type in ["dependencies", "devDependencies"]:
+                if dep_type in data:
+                    for name, version in data[dep_type].items():
+                        # Remove version specifier symbols like ^ or ~
+                        clean_version = version.lstrip("^~>=<")
+                        dependencies.append({"name": name, "version": clean_version})
+        except Exception:
+            # Fallback if JSON parsing fails
+            pass
+            
+        return dependencies
+    
+    def _extract_maven_dependencies(self, file_path):
+        """Extract Maven dependencies from pom.xml."""
+        try:
+            import xml.etree.ElementTree as ET
+            dependencies = []
+            
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            
+            # Maven XML has namespaces, need to handle them
+            namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
+            
+            for dep in root.findall(".//m:dependency", namespace):
+                groupId = dep.find("m:groupId", namespace)
+                artifactId = dep.find("m:artifactId", namespace)
+                version = dep.find("m:version", namespace)
+                
+                if groupId is not None and artifactId is not None:
+                    name = f"{groupId.text}:{artifactId.text}"
+                    version_text = version.text if version is not None else "unknown"
+                    dependencies.append({"name": name, "version": version_text})
+                    
+        except ImportError:
+            # If xml module not available in this context
+            pass
+        except Exception:
+            # If XML parsing fails
+            pass
+            
+        return dependencies
+    
+    def _extract_gradle_dependencies(self, file_path):
+        """Extract Gradle dependencies from build.gradle."""
+        dependencies = []
+        
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+                
+            # Look for dependency declarations in Gradle format
+            import re
+            # Pattern matches: implementation 'group:name:version' or compile 'group:name:version'
+            pattern = r'(?:implementation|compile|api|testImplementation)\s+[\'"]([^:]+):([^:]+):([^\'"]+)[\'"]'
+            matches = re.findall(pattern, content)
+            
+            for group, name, version in matches:
+                full_name = f"{group}:{name}"
+                dependencies.append({"name": full_name, "version": version})
+        except Exception:
+            # If parsing fails
+            pass
+            
+        return dependencies
+    
+    def _extract_nuget_dependencies(self, file_path):
+        """Extract NuGet dependencies from .csproj files."""
+        dependencies = []
+        
+        try:
+            import xml.etree.ElementTree as ET
+            
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            
+            # Look for PackageReference elements
+            for package_ref in root.findall(".//PackageReference"):
+                name = package_ref.get("Include")
+                version = package_ref.get("Version")
+                
+                if name:
+                    dependencies.append({"name": name, "version": version or "unknown"})
+        except ImportError:
+            # If xml module not available
+            pass
+        except Exception:
+            # If XML parsing fails
+            pass
+            
+        return dependencies
+    
+    def _check_dependency_vulnerabilities(self, package_name, version):
+        """Check for vulnerabilities in a specific package version using NVD API.
+        
+        Args:
+            package_name: Name of the package
+            version: Version of the package
+            
+        Returns:
+            List of vulnerabilities found for this package
+        """
         vulnerabilities = []
         
-        if file_ext == ".py":
-            dependencies = [
-                {"name": "requests", "version": "2.25.1"},
-                {"name": "django", "version": "3.1.6"},
-                {"name": "flask", "version": "1.1.2"},
-                {"name": "numpy", "version": "1.20.1"}
-            ]
-            
-            # Add some sample vulnerabilities
-            vulnerabilities = [
-                {
-                    "id": "CVE-2021-12345",
-                    "package": "django",
-                    "version": "3.1.6",
-                    "severity": "High",
-                    "description": "SQL injection vulnerability in Django ORM",
-                    "recommendation": "Upgrade to Django 3.2.1 or later"
-                },
-                {
-                    "id": "CVE-2021-54321",
-                    "package": "flask",
-                    "version": "1.1.2",
-                    "severity": "Medium",
-                    "description": "Cross-site scripting vulnerability in Flask templates",
-                    "recommendation": "Upgrade to Flask 2.0.0 or later"
-                }
-            ]
-            
-        elif file_ext in [".js", ".json"]:
-            dependencies = [
-                {"name": "axios", "version": "0.21.1"},
-                {"name": "react", "version": "17.0.1"},
-                {"name": "lodash", "version": "4.17.20"},
-                {"name": "express", "version": "4.17.1"}
-            ]
-            
-            # Add some sample vulnerabilities
-            vulnerabilities = [
-                {
-                    "id": "CVE-2021-23358",
-                    "package": "lodash",
-                    "version": "4.17.20",
-                    "severity": "Medium",
-                    "description": "Command injection vulnerability in Lodash",
-                    "recommendation": "Upgrade to Lodash 4.17.21 or later"
-                }
-            ]
-            
-        elif file_ext in [".jar", ".java", ".class"]:
-            dependencies = [
-                {"name": "org.springframework:spring-core", "version": "5.3.3"},
-                {"name": "com.fasterxml.jackson.core:jackson-databind", "version": "2.12.1"},
-                {"name": "org.apache.logging.log4j:log4j-core", "version": "2.13.3"},
-                {"name": "com.google.guava:guava", "version": "30.1-jre"}
-            ]
-            
-            # Add some sample vulnerabilities
-            vulnerabilities = [
-                {
-                    "id": "CVE-2021-44228",
-                    "package": "org.apache.logging.log4j:log4j-core",
-                    "version": "2.13.3",
-                    "severity": "High",
-                    "description": "Remote code execution vulnerability in Log4j",
-                    "recommendation": "Upgrade to Log4j 2.15.0 or later"
-                },
-                {
-                    "id": "CVE-2020-36518",
-                    "package": "com.fasterxml.jackson.core:jackson-databind",
-                    "version": "2.12.1",
-                    "severity": "Medium",
-                    "description": "Deserialization vulnerability in Jackson Databind",
-                    "recommendation": "Upgrade to Jackson Databind 2.12.6 or later"
-                }
-            ]
-        
-        return {
-            "scan_id": f"dep-scan-{int(time.time())}",
-            "file": file_path,
-            "scan_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "dependencies": dependencies,
-            "vulnerabilities": vulnerabilities,
-            "summary": {
-                "total_dependencies": len(dependencies),
-                "vulnerable_dependencies": len(set(v["package"] for v in vulnerabilities)),
-                "high_severity": sum(1 for v in vulnerabilities if v["severity"] == "High"),
-                "medium_severity": sum(1 for v in vulnerabilities if v["severity"] == "Medium"),
-                "low_severity": sum(1 for v in vulnerabilities if v["severity"] == "Low")
+        # For this implementation, we'll use the NVD API to search for CVEs
+        # In a real implementation, you might use a service like OSS Index, Sonatype, or NVD
+        try:
+            # This is a simplified approach
+            # In a real implementation, you would need to match specific package versions to CVEs
+            params = {
+                'keywordSearch': package_name
             }
-        }
+            
+            headers = {'User-Agent': 'SecurityScannerMCP/1.0'}
+            response = requests.get(self.nvd_api_base, params=params, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                for cve_item in data.get('vulnerabilities', []):
+                    cve = cve_item.get('cve', {})
+                    cve_id = cve.get('id', '')
+                    
+                    # Simplified matching - in practice, you'd want to match exact package and version
+                    # This is a limitation of the NVD API for package-specific version checks
+                    # A better approach would be using a service like OSS Index or Sonatype
+                    vulnerabilities.append({
+                        "id": cve_id,
+                        "package": package_name,
+                        "version": version,
+                        "severity": self._get_cve_severity(cve),
+                        "description": self._get_cve_description(cve),
+                        "recommendation": f"Check if version {version} is affected and upgrade if necessary"
+                    })
+        except Exception:
+            # If NVD API call fails, return empty list
+            # In a real implementation, you might want to try alternative sources
+            pass
+        
+        return vulnerabilities
+    
+    def _get_cve_severity(self, cve_data):
+        """Extract severity from CVE data."""
+        try:
+            metrics = cve_data.get('metrics', {})
+            
+            # Look for different possible CVSS versions
+            if 'cvssMetricV31' in metrics and metrics['cvssMetricV31']:
+                severity = metrics['cvssMetricV31'][0]['cvssData']['baseSeverity']
+            elif 'cvssMetricV30' in metrics and metrics['cvssMetricV30']:
+                severity = metrics['cvssMetricV30'][0]['cvssData']['baseSeverity']
+            elif 'cvssMetricV2' in metrics and metrics['cvssMetricV2']:
+                base_score = metrics['cvssMetricV2'][0]['cvssData']['baseScore']
+                if float(base_score) >= 7.0:
+                    severity = "High"
+                elif float(base_score) >= 4.0:
+                    severity = "Medium"
+                else:
+                    severity = "Low"
+            else:
+                severity = "Unknown"
+        except:
+            severity = "Unknown"
+        
+        return severity
+    
+    def _get_cve_description(self, cve_data):
+        """Extract description from CVE data."""
+        try:
+            descriptions = cve_data.get('descriptions', [])
+            if descriptions:
+                return descriptions[0].get('value', 'No description available')
+        except:
+            pass
+        
+        return "No description available"
 
 
 # Main entry point

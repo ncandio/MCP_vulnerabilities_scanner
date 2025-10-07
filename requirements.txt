@@ -1,2 +1,3 @@
-# Core dependencies
-tkinter  # Usually included with Python installation
+# Security scanning dependencies
+requests>=2.25.1
+python-owasp-zap-v2.4>=0.1.0
